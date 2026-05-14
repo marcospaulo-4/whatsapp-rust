@@ -176,6 +176,24 @@ pub struct MsgMetaInfo {
     pub deprecated_lid_session: Option<bool>,
     pub thread_message_id: Option<MessageId>,
     pub thread_message_sender_jid: Option<Jid>,
+    /// `<meta content_type=...>` attr. Server marks reactions/edits as
+    /// `"add_on"`; mirrors `WAWebHandleMsgParser` b()'s metadata read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_type: Option<String>,
+    /// `<meta appdata=...>` attr. `"default"` is the only observed value.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub appdata: Option<String>,
+    /// `<reporting><reporting_tag>` content bytes (16 or 20). Pre-requisite
+    /// for the server-side report-abuse flow.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reporting_tag: Option<Vec<u8>>,
+    /// `<reporting><reporting_token>` content bytes (16). Pre-requisite
+    /// for the server-side report-abuse flow.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reporting_token: Option<Vec<u8>>,
+    /// `v` attr on `<reporting_token>`. WA Web defaults to 1 when missing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reporting_token_version: Option<i64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -201,6 +219,25 @@ pub struct MessageInfo {
     /// Set when this message was recovered via PDO rather than normal decryption.
     /// Contains the PDO request message ID.
     pub unavailable_request_id: Option<String>,
+    /// Server-store timestamp in microseconds (envelope `sts` attr). Used by
+    /// WA Web for read-self watermark ordering across companion devices.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_timestamp_us: Option<i64>,
+    /// Envelope `verified_level` attr (e.g. "unknown"/"low"/"high"). For
+    /// business messages this is the server-asserted verification tier; for
+    /// regular messages it is absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verified_level: Option<String>,
+    /// Envelope `verified_name` int attr (business name certificate serial).
+    /// Separate from the `verified_name` child cert bytes already on this
+    /// struct.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verified_name_serial: Option<i64>,
+    /// Envelope `peer_recipient_pn` attr. Present on companion-device
+    /// self-synced DM stanzas to identify the peer's PN (so the receipt
+    /// goes to the right routing target).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peer_recipient_pn: Option<Jid>,
 }
 
 impl MessageInfo {

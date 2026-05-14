@@ -263,6 +263,46 @@ pub fn parse_message_info(
 
     let is_offline = attrs.optional_string("offline").is_some();
 
+    // Envelope enrichment (mirrors WAWebHandleMsgParser y() function).
+    let server_timestamp_us = attrs
+        .optional_u64("sts")
+        .and_then(|v| i64::try_from(v).ok());
+    let verified_level = attrs
+        .optional_string("verified_level")
+        .map(|s| s.into_owned());
+    let verified_name_serial = attrs
+        .optional_u64("verified_name")
+        .and_then(|v| i64::try_from(v).ok());
+    let peer_recipient_pn = attrs.optional_jid("peer_recipient_pn");
+
+    // <meta> child attrs (WAWebHandleMsgParser b()) and <reporting> children
+    // (I() function). Both are optional; absence is the common case.
+    let mut meta_info = crate::types::message::MsgMetaInfo::default();
+    if let Some(meta) = node.get_optional_child("meta") {
+        let mut ma = meta.attrs();
+        meta_info.content_type = ma.optional_string("content_type").map(|s| s.into_owned());
+        meta_info.appdata = ma.optional_string("appdata").map(|s| s.into_owned());
+    }
+    if let Some(reporting) = node.get_optional_child("reporting")
+        && let Some(tag) = reporting.get_optional_child("reporting_tag")
+    {
+        meta_info.reporting_tag = tag.content_bytes().map(|b| b.to_vec());
+    }
+    if let Some(reporting) = node.get_optional_child("reporting")
+        && let Some(token) = reporting.get_optional_child("reporting_token")
+    {
+        meta_info.reporting_token = token.content_bytes().map(|b| b.to_vec());
+        // WA Web `I()`: `c.maybeAttrInt("v")!=null?_:1`. Missing `v` is
+        // not a parse failure — token format version defaults to 1.
+        meta_info.reporting_token_version = Some(
+            token
+                .attrs()
+                .optional_u64("v")
+                .and_then(|v| i64::try_from(v).ok())
+                .unwrap_or(1),
+        );
+    }
+
     Ok(MessageInfo {
         source,
         id,
@@ -278,6 +318,11 @@ pub fn parse_message_info(
             .map(|s| EditAttribute::from(s.to_string()))
             .unwrap_or_default(),
         is_offline,
+        server_timestamp_us,
+        verified_level,
+        verified_name_serial,
+        peer_recipient_pn,
+        meta_info,
         ..Default::default()
     })
 }
@@ -316,6 +361,172 @@ mod parse_message_info_tests {
             .expect("status broadcast must expose participant_lid as sender_alt");
         assert_eq!(alt.user, lid_user);
         assert_eq!(alt.server, wacore_binary::Server::Lid);
+    }
+
+    /// Envelope-enrichment attributes (`sts`, `verified_level`,
+    /// `verified_name`, `peer_recipient_pn`) flow into `MessageInfo` fields.
+    /// Mirrors `WAWebHandleMsgParser` y() function which threads
+    /// `serverStoreTimeMicros`/`verifiedLevel`/`verifiedNameSerial`/
+    /// `peerRecipientPn` into the msgInfo result.
+    #[test]
+    fn envelope_enrichment_fields_are_captured() {
+        let own_pn = Jid::from_str("559900000000@s.whatsapp.net").unwrap();
+        let node = NodeBuilder::new("message")
+            .attr("from", "99000000000001@s.whatsapp.net")
+            .attr("type", "text")
+            .attr("id", "MSG-ENV-1")
+            .attr("t", "1777415965")
+            .attr("sts", "1777415965123456")
+            .attr("verified_level", "unknown")
+            .attr("verified_name", "12345")
+            .attr("peer_recipient_pn", "559980000099@s.whatsapp.net")
+            .build();
+        let info = parse_message_info(&node.as_node_ref(), &own_pn, None).unwrap();
+
+        assert_eq!(info.server_timestamp_us, Some(1777415965123456));
+        assert_eq!(info.verified_level.as_deref(), Some("unknown"));
+        assert_eq!(info.verified_name_serial, Some(12345));
+        assert_eq!(
+            info.peer_recipient_pn.as_ref().map(|j| j.user.as_str()),
+            Some("559980000099")
+        );
+    }
+
+    /// Envelope without any of the optional enrichment attrs leaves all
+    /// four fields as `None`. Regression guard against accidentally
+    /// defaulting them.
+    #[test]
+    fn envelope_enrichment_is_optional() {
+        let own_pn = Jid::from_str("559900000000@s.whatsapp.net").unwrap();
+        let node = NodeBuilder::new("message")
+            .attr("from", "99000000000001@s.whatsapp.net")
+            .attr("type", "text")
+            .attr("id", "MSG-ENV-NONE")
+            .attr("t", "1777415965")
+            .build();
+        let info = parse_message_info(&node.as_node_ref(), &own_pn, None).unwrap();
+
+        assert!(info.server_timestamp_us.is_none());
+        assert!(info.verified_level.is_none());
+        assert!(info.verified_name_serial.is_none());
+        assert!(info.peer_recipient_pn.is_none());
+    }
+
+    /// `<meta content_type="add_on"/>` (reactions/edits) and
+    /// `<meta appdata="default"/>` are captured on `MsgMetaInfo`.
+    /// Real shape observed in production for reactions.
+    #[test]
+    fn meta_child_attrs_are_captured() {
+        let own_pn = Jid::from_str("559900000000@s.whatsapp.net").unwrap();
+        let node = NodeBuilder::new("message")
+            .attr("from", "99000000000001@s.whatsapp.net")
+            .attr("type", "reaction")
+            .attr("id", "MSG-REACT-1")
+            .attr("t", "1777415965")
+            .children([NodeBuilder::new("meta")
+                .attr("content_type", "add_on")
+                .build()])
+            .build();
+        let info = parse_message_info(&node.as_node_ref(), &own_pn, None).unwrap();
+        assert_eq!(info.meta_info.content_type.as_deref(), Some("add_on"));
+        assert!(info.meta_info.appdata.is_none());
+    }
+
+    /// `<reporting><reporting_tag>{bytes}</reporting_tag>
+    /// <reporting_token v="2">{bytes}</reporting_token></reporting>` shape
+    /// from production. Tag may be 16 or 20 bytes; token usually 16.
+    #[test]
+    fn reporting_token_and_tag_are_captured() {
+        let own_pn = Jid::from_str("559900000000@s.whatsapp.net").unwrap();
+        let tag_bytes: Vec<u8> = (0..16).collect();
+        let token_bytes: Vec<u8> = (16..32).collect();
+        let node = NodeBuilder::new("message")
+            .attr("from", "99000000000001@s.whatsapp.net")
+            .attr("type", "text")
+            .attr("id", "MSG-REP-1")
+            .attr("t", "1777415965")
+            .children([NodeBuilder::new("reporting")
+                .children([
+                    NodeBuilder::new("reporting_tag")
+                        .bytes(tag_bytes.clone())
+                        .build(),
+                    NodeBuilder::new("reporting_token")
+                        .attr("v", "2")
+                        .bytes(token_bytes.clone())
+                        .build(),
+                ])
+                .build()])
+            .build();
+        let info = parse_message_info(&node.as_node_ref(), &own_pn, None).unwrap();
+        assert_eq!(
+            info.meta_info.reporting_tag.as_deref(),
+            Some(tag_bytes.as_slice())
+        );
+        assert_eq!(
+            info.meta_info.reporting_token.as_deref(),
+            Some(token_bytes.as_slice())
+        );
+        assert_eq!(info.meta_info.reporting_token_version, Some(2));
+    }
+
+    /// Missing `v` attr on `<reporting_token>` defaults the version to 1
+    /// (matches WA Web `I()`: `c.maybeAttrInt("v") != null ? _ : 1`).
+    #[test]
+    fn reporting_token_missing_version_defaults_to_one() {
+        let own_pn = Jid::from_str("559900000000@s.whatsapp.net").unwrap();
+        let node = NodeBuilder::new("message")
+            .attr("from", "99000000000001@s.whatsapp.net")
+            .attr("type", "text")
+            .attr("id", "MSG-REP-V")
+            .attr("t", "1777415965")
+            .children([NodeBuilder::new("reporting")
+                .children([NodeBuilder::new("reporting_token")
+                    .bytes(vec![0xAA; 16])
+                    .build()])
+                .build()])
+            .build();
+        let info = parse_message_info(&node.as_node_ref(), &own_pn, None).unwrap();
+        assert_eq!(info.meta_info.reporting_token_version, Some(1));
+    }
+
+    /// `<reporting>` with ONLY `<reporting_tag>` (no token) is also valid
+    /// in production; token fields stay `None`.
+    #[test]
+    fn reporting_tag_only_leaves_token_none() {
+        let own_pn = Jid::from_str("559900000000@s.whatsapp.net").unwrap();
+        let node = NodeBuilder::new("message")
+            .attr("from", "99000000000001@s.whatsapp.net")
+            .attr("type", "text")
+            .attr("id", "MSG-REP-2")
+            .attr("t", "1777415965")
+            .children([NodeBuilder::new("reporting")
+                .children([NodeBuilder::new("reporting_tag")
+                    .bytes(vec![1u8; 16])
+                    .build()])
+                .build()])
+            .build();
+        let info = parse_message_info(&node.as_node_ref(), &own_pn, None).unwrap();
+        assert!(info.meta_info.reporting_tag.is_some());
+        assert!(info.meta_info.reporting_token.is_none());
+        assert!(info.meta_info.reporting_token_version.is_none());
+    }
+
+    /// Message with no `<meta>` and no `<reporting>` leaves all the new
+    /// `MsgMetaInfo` fields `None`.
+    #[test]
+    fn meta_and_reporting_absent_leaves_all_none() {
+        let own_pn = Jid::from_str("559900000000@s.whatsapp.net").unwrap();
+        let node = NodeBuilder::new("message")
+            .attr("from", "99000000000001@s.whatsapp.net")
+            .attr("type", "text")
+            .attr("id", "MSG-PLAIN")
+            .attr("t", "1777415965")
+            .build();
+        let info = parse_message_info(&node.as_node_ref(), &own_pn, None).unwrap();
+        assert!(info.meta_info.content_type.is_none());
+        assert!(info.meta_info.appdata.is_none());
+        assert!(info.meta_info.reporting_tag.is_none());
+        assert!(info.meta_info.reporting_token.is_none());
     }
 
     /// Symmetric branch: when `participant` is a LID, `sender_alt` must come
